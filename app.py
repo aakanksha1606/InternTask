@@ -6,12 +6,28 @@ import streamlit as st
 import torch
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
 from textblob import TextBlob
-import re
 import random
+import re
 
-# Streamlit config
-st.set_page_config(page_title="Sentiment-Based Text Generator", page_icon="🤖", layout="wide")
+# ---------------- Page Configuration ----------------
+st.set_page_config(
+    page_title="AI Text Generator",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
 
+# ---------------- Load External CSS ----------------
+def load_css(file_name="style.css"):
+    try:
+        with open(file_name) as f:
+            st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
+    except FileNotFoundError:
+        st.warning(f"CSS file not found: {file_name}")
+
+load_css("style.css")
+
+# ---------------- Cache Models ----------------
 @st.cache_resource(show_spinner=False)
 def _load_models_cached():
     sentiment_pipe = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
@@ -22,6 +38,7 @@ def _load_models_cached():
     return sentiment_pipe, tokenizer, model
 
 
+# ---------------- Text Generation Class ----------------
 class SentimentTextGenerator:
     def __init__(self, fast_mode=False, defer_load=False):
         self.sentiment_analyzer = None
@@ -36,9 +53,9 @@ class SentimentTextGenerator:
             try:
                 self.sentiment_analyzer, self.tokenizer, self.model = _load_models_cached()
                 st.success("Models loaded successfully!")
-            except Exception:
+            except Exception as e:
                 self.fast_mode = True
-                st.warning("Switched to fast mode (no heavy models).")
+                st.warning(f"Switched to fast mode. Reason: {e}")
 
     def analyze_sentiment(self, text):
         if self.fast_mode:
@@ -46,7 +63,7 @@ class SentimentTextGenerator:
         try:
             result = self.sentiment_analyzer(text)[0]
             label = result["label"].upper()
-            score = result["score"]
+            score = float(result["score"])
             if score < 0.6:
                 label = "NEUTRAL"
             return {"label": label, "confidence": score}
@@ -54,8 +71,7 @@ class SentimentTextGenerator:
             return self._fallback_sentiment(text)
 
     def _fallback_sentiment(self, text):
-        blob = TextBlob(text)
-        polarity = blob.sentiment.polarity
+        polarity = TextBlob(text).sentiment.polarity
         if polarity > 0.1:
             return {"label": "POSITIVE", "confidence": polarity}
         elif polarity < -0.1:
@@ -63,98 +79,67 @@ class SentimentTextGenerator:
         else:
             return {"label": "NEUTRAL", "confidence": 0.5}
 
-    def generate_text(self, prompt, sentiment, text_size, temperature=0.8):
-        """Generate essay text according to size."""
-        size_settings = {
-            "Short (50-100 words)": 100,
-            "Medium (100-200 words)": 180,
-            "Long (200+ words)": 250
-        }
-        max_length = size_settings.get(text_size, 180)
-
+    def generate_text(self, prompt, sentiment, max_new_tokens=200, temperature=0.8):
+        """
+        Generate elaborative text that aligns with the detected sentiment.
+        The AI elaborates on the prompt while keeping tone consistent with sentiment.
+        """
         if self.fast_mode:
-            return self._fallback_generation(prompt, sentiment, text_size)
+            return self._fallback_generation(prompt, sentiment)
+
+        tone_guidance = {
+            "POSITIVE": "Use inspiring, optimistic, and emotionally uplifting language.",
+            "NEGATIVE": "Use thoughtful, empathetic, and emotionally honest language while maintaining depth.",
+            "NEUTRAL": "Use balanced, factual, and steady language focused on clarity and context."
+        }
+        tone = tone_guidance.get(sentiment, "Use natural, human-like writing style.")
+
+        instruction = (
+            f"Analyze the sentiment of the topic and write a natural, coherent paragraph "
+            f"that elaborates on it according to the detected sentiment.\n\n"
+            f"Topic: {prompt}\n"
+            f"Sentiment: {sentiment}\n"
+            f"Guideline: {tone}\n\n"
+            "Elaboration:"
+        )
 
         try:
-            intro = self._get_intro(sentiment)
-            full_prompt = f"{intro} {prompt}"
-            inputs = self.tokenizer.encode(full_prompt, return_tensors="pt", truncation=True)
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    inputs,
-                    max_length=max_length,
-                    temperature=temperature,
-                    do_sample=True,
-                    top_k=50,
-                    top_p=0.9,
-                    repetition_penalty=1.2,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                )
-            text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            text = text[len(full_prompt):].strip()
+            inputs = self.tokenizer(instruction, return_tensors="pt", truncation=True)
+            input_len = inputs["input_ids"].shape[1]
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                do_sample=True,
+                top_k=50,
+                top_p=0.9,
+                no_repeat_ngram_size=3,
+                pad_token_id=self.tokenizer.eos_token_id
+            )
+            generated_tokens = outputs[0][input_len:]
+            text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            text = re.sub(r"^\s*Elaboration[:\-\s]*", "", text, flags=re.I).strip()
             return self._clean_text(text)
         except Exception:
-            return self._fallback_generation(prompt, sentiment, text_size)
+            return self._fallback_generation(prompt, sentiment)
 
-    def _get_intro(self, sentiment):
-        options = {
-            "POSITIVE": [
-                "Life often surprises us with moments of pure joy and gratitude.",
-                "There are days when optimism fills every corner of our mind.",
-                "Positivity gives strength to see beauty even in simple things."
-            ],
-            "NEGATIVE": [
-                "Sometimes the world feels heavy, and everything seems uncertain.",
-                "There are moments when darkness clouds the heart and thoughts feel blurred.",
-                "Life isn’t always kind; certain days test patience and hope alike."
-            ],
-            "NEUTRAL": [
-                "Not every situation carries strong emotions; some moments simply are.",
-                "Life moves steadily, presenting facts without extremes of joy or sorrow.",
-                "There are days that pass quietly, neither bright nor dark, just balanced."
-            ]
-        }
-        return random.choice(options.get(sentiment, options["NEUTRAL"]))
-
-    def _fallback_generation(self, prompt, sentiment, text_size):
-        """Generate essay-like text in fallback mode."""
+    def _fallback_generation(self, prompt, sentiment):
         base = prompt.strip().capitalize()
-        sentences = {
-            "short": 3,
-            "medium": 5,
-            "long": 7
-        }
-        count = 5
-        if "Short" in text_size:
-            count = sentences["short"]
-        elif "Long" in text_size:
-            count = sentences["long"]
-
         if sentiment == "POSITIVE":
-            parts = [
-                f"{base}. This situation reflects hope, inspiration, and gratitude.",
-                "Small victories remind us that growth takes time, but each effort matters.",
-                "The energy of positivity builds resilience, helping people move forward.",
-                "Even simple moments can feel meaningful when they are filled with appreciation.",
-                "Ultimately, optimism becomes a quiet power that turns challenges into possibilities."
-            ]
+            text = (
+                f"{base}. It reflects inspiration, motivation, and a sense of hope, "
+                "highlighting how positivity can fuel creativity and growth."
+            )
         elif sentiment == "NEGATIVE":
-            parts = [
-                f"{base}. It expresses frustration and emotional weight that often comes from struggle.",
-                "In such times, patience feels thin and the world appears distant.",
-                "Yet within every hardship lies a lesson waiting to be understood.",
-                "Acknowledging pain does not make one weak; it opens space for healing.",
-                "Over time, reflection transforms sorrow into strength and awareness."
-            ]
+            text = (
+                f"{base}. It explores the challenges, struggles, and emotions tied to the experience, "
+                "emphasizing resilience and human strength."
+            )
         else:
-            parts = [
-                f"{base}. It represents a balanced observation rather than emotion.",
-                "Things unfold as they are, and clarity comes from distance.",
-                "Neutrality offers perspective, helping us see both sides without bias.",
-                "Calm reflection allows ideas to form without rushing toward judgment.",
-                "In the end, balance brings understanding and quiet confidence."
-            ]
-        return " ".join(parts[:count])
+            text = (
+                f"{base}. It presents a balanced elaboration that offers perspective and thoughtful detail."
+            )
+        return text
 
     def _clean_text(self, text):
         text = re.sub(r"\s+", " ", text).strip()
@@ -163,61 +148,73 @@ class SentimentTextGenerator:
         return text[0].upper() + text[1:]
 
 
+# ---------------- Main Streamlit App ----------------
 def main():
-    st.title("🤖 Sentiment-Based Text Generator")
-    st.markdown("Generate **paragraphs or essays** aligned with the sentiment of your input prompt.")
+    st.markdown("<h1 style='text-align:center;'>🤖 AI Text Generator</h1>", unsafe_allow_html=True)
+    st.markdown(
+        "<p class='subheader' style='text-align:center; font-size:18px; color:white;'>"
+        "Generate meaningful elaborations — expanding your idea, not explaining it."
+        "</p>",
+        unsafe_allow_html=True
+    )
 
-    # Sidebar controls
     with st.sidebar:
         st.header("⚙️ Settings")
-        fast_mode = st.toggle("⚡ Fast mode", value=True)
+        fast_mode = st.toggle("⚡ Fast Mode", value=True)
         if "generator" not in st.session_state:
             st.session_state.generator = SentimentTextGenerator(fast_mode=fast_mode, defer_load=True)
         else:
             st.session_state.generator.fast_mode = fast_mode
 
-        manual_sentiment = st.selectbox("Sentiment override:", ["Auto-detect", "Positive", "Negative", "Neutral"])
+        theme_choice = st.selectbox("Theme", ["Light", "Dark"])
+        if theme_choice == "Light":
+            load_css("style.css")
+        else:
+            load_css("style_dark.css")
+
+        manual_sentiment = st.selectbox("Sentiment", ["Auto-detect", "Positive", "Negative", "Neutral"])
         temperature = st.slider("Creativity", 0.1, 1.5, 0.8, 0.1)
-        text_size = st.selectbox(
-            "Generated text size:",
-            ["Short (50-100 words)", "Medium (100-200 words)", "Long (200+ words)"],
-            index=1
-        )
+        text_size = st.selectbox("Text Length", ["Short", "Medium", "Long"], index=1)
 
-    st.subheader("📝 Input Prompt")
-    user_prompt = st.text_area("Enter your prompt here:", height=100)
-    generate_button = st.button("🚀 Generate Text", use_container_width=True)
+        # Map text length to max_new_tokens
+        if text_size == "Short":
+            max_tokens = 100
+        elif text_size == "Medium":
+            max_tokens = 200
+        else:
+            max_tokens = 300
 
-    if user_prompt and generate_button:
-        with st.spinner("Analyzing sentiment..."):
-            sentiment_result = st.session_state.generator.analyze_sentiment(user_prompt)
-            if manual_sentiment != "Auto-detect":
-                sentiment_result["label"] = manual_sentiment.upper()
+    left_col, right_col = st.columns(2, gap="large")
 
-        st.markdown("---")
-        st.subheader("📊 Sentiment Analysis Result")
-        st.write(f"**Detected Sentiment:** {sentiment_result['label']}")
-        st.write(f"**Confidence:** {sentiment_result['confidence']:.1%}")
+    with left_col:
+        st.markdown("<div class='box-wrapper'>", unsafe_allow_html=True)
+        st.markdown("### 📝 Enter Your Prompt")
+        user_prompt = st.text_area("Your text:", height=350, key="input_text")
+        generate_clicked = st.button("✨ Generate Text", use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-        with st.spinner("Generating text..."):
-            generated_text = st.session_state.generator.generate_text(
-                user_prompt,
-                sentiment_result["label"],
-                text_size,
-                temperature=temperature
-            )
+    with right_col:
+        st.markdown("<div class='box-wrapper'>", unsafe_allow_html=True)
+        st.markdown("### 🧠 Generated Text")
+        if generate_clicked and user_prompt:
+            with st.spinner("Analyzing and generating..."):
+                sentiment_result = st.session_state.generator.analyze_sentiment(user_prompt)
+                if manual_sentiment != "Auto-detect":
+                    sentiment_result["label"] = manual_sentiment.upper()
+                gen = st.session_state.generator.generate_text(
+                    user_prompt,
+                    sentiment_result["label"],
+                    max_new_tokens=max_tokens,
+                    temperature=temperature
+                )
+            st.success(gen)
+            st.caption(f"Detected Sentiment: {sentiment_result['label']}")
+        else:
+            st.info("👈 Enter your text and click Generate Text.")
+        st.markdown("</div>", unsafe_allow_html=True)
 
-        st.markdown("---")
-        st.subheader("🧠 Generated Text")
-        st.write(generated_text)
-        st.caption(f"Word count: {len(generated_text.split())}")
-
-        if st.button("📋 Copy to Clipboard"):
-            st.code(generated_text)
-            st.success("Text copied!")
-
-    st.markdown("---")
-    st.caption("Built with ❤️ using Streamlit, Transformers, and PyTorch")
+    st.markdown("<hr class='footer-line'>", unsafe_allow_html=True)
+    st.markdown("<p class='footer'>💡 Built with ❤️ using Streamlit and Transformers.</p>", unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
