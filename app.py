@@ -1,5 +1,5 @@
 import streamlit as st
-from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from textblob import TextBlob
 import re
 
@@ -21,37 +21,45 @@ def load_css(file_name="style.css"):
 
 load_css("style.css")
 
-# ---------------- Load Pipelines ----------------
+# ---------------- Load GPT-2 Model ----------------
 @st.cache_resource(show_spinner=False)
-def load_models():
-    sentiment_pipe = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
+def load_gpt2():
     tokenizer = AutoTokenizer.from_pretrained("distilgpt2")
     model = AutoModelForCausalLM.from_pretrained("distilgpt2")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    return sentiment_pipe, tokenizer, model
+    return tokenizer, model
 
-sentiment_analyzer, tokenizer, model = load_models()
+tokenizer, model = load_gpt2()
 
 # ---------------- Helper Functions ----------------
 def analyze_sentiment(text):
-    try:
-        result = sentiment_analyzer(text)[0]
-        label = result["label"].upper()
-        score = float(result["score"])
-        if score < 0.6:
-            label = "NEUTRAL"
-        return {"label": label, "confidence": score}
-    except Exception:
-        polarity = TextBlob(text).sentiment.polarity
-        if polarity > 0.1:
-            return {"label": "POSITIVE", "confidence": polarity}
-        elif polarity < -0.1:
-            return {"label": "NEGATIVE", "confidence": abs(polarity)}
-        else:
-            return {"label": "NEUTRAL", "confidence": 0.5}
+    """CPU-only sentiment using TextBlob."""
+    polarity = TextBlob(text).sentiment.polarity
+    if polarity > 0.1:
+        return {"label": "POSITIVE", "confidence": polarity}
+    elif polarity < -0.1:
+        return {"label": "NEGATIVE", "confidence": abs(polarity)}
+    else:
+        return {"label": "NEUTRAL", "confidence": 0.5}
+
+def clean_text(text):
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text.endswith(('.', '!', '?')):
+        text += "."
+    return text[0].upper() + text[1:]
+
+def fallback_generation(prompt, sentiment):
+    base = prompt.strip().capitalize()
+    if sentiment == "POSITIVE":
+        return f"{base}. It continues with an optimistic and uplifting elaboration."
+    elif sentiment == "NEGATIVE":
+        return f"{base}. It continues with a reflective and thoughtful elaboration."
+    else:
+        return f"{base}. It continues with a neutral and balanced elaboration."
 
 def generate_text(prompt, sentiment, max_new_tokens=200, temperature=0.8, text_size="Medium"):
+    """Generate text with distilgpt2 and approximate word limit."""
     tone_map = {
         "POSITIVE": "optimistic, uplifting",
         "NEGATIVE": "reflective, thoughtful",
@@ -86,35 +94,21 @@ def generate_text(prompt, sentiment, max_new_tokens=200, temperature=0.8, text_s
             text = " ".join(words[:max_words])
 
         return clean_text(text)
-
     except Exception:
         return fallback_generation(prompt, sentiment)
-
-def fallback_generation(prompt, sentiment):
-    base = prompt.strip().capitalize()
-    if sentiment == "POSITIVE":
-        return f"{base}. It continues with an optimistic and uplifting elaboration."
-    elif sentiment == "NEGATIVE":
-        return f"{base}. It continues with a reflective and thoughtful elaboration."
-    else:
-        return f"{base}. It continues with a neutral and balanced elaboration."
-
-def clean_text(text):
-    text = re.sub(r"\s+", " ", text).strip()
-    if not text.endswith(('.', '!', '?')):
-        text += "."
-    return text[0].upper() + text[1:]
 
 # ---------------- Main App ----------------
 st.markdown("<h1>🤖 AI Text Generator</h1>", unsafe_allow_html=True)
 st.markdown("<p class='subheader'>Generate meaningful elaborations — expanding your idea.</p>", unsafe_allow_html=True)
 
+# ---------------- Sidebar ----------------
 with st.sidebar:
     st.header("⚙️ Settings")
     st.session_state.text_size = st.selectbox("Text Length", ["Short", "Medium", "Long"], index=1)
     manual_sentiment = st.selectbox("Sentiment", ["Auto-detect", "Positive", "Negative", "Neutral"])
     temperature = st.slider("Creativity", 0.1, 1.5, 0.8, 0.1)
 
+# ---------------- Layout ----------------
 col1, col2 = st.columns(2, gap="large")
 
 with col1:
